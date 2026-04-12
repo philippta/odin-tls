@@ -161,13 +161,18 @@ recv :: proc(conn: ^Connection, buf: []byte, cb: Callback) {
 
 	recv_cb(nil, tlsop)
 
-	recv_cb :: proc(_: ^nbio.Operation, tlsop: ^Operation) {
-		log.debug("recv_cb")
-
+	recv_cb :: proc(op: ^nbio.Operation, tlsop: ^Operation) {
 		blocked: s2n.Blocked_Status
 		n := s2n.s2n_recv(tlsop.conn, raw_data(tlsop.recv.buf), len(tlsop.recv.buf), &blocked)
 		if n >= 0 {
 			tlsop.recv.received = n
+			tlsop.cb(tlsop)
+			free(tlsop)
+			return
+		}
+
+		if _s2n_error() != .Blocked {
+			tlsop.recv.received = 0
 			tlsop.cb(tlsop)
 			free(tlsop)
 			return
@@ -202,6 +207,13 @@ send :: proc(conn: ^Connection, buf: []byte, cb: Callback) {
 			return
 		}
 
+		if _s2n_error() != .Blocked {
+			tlsop.recv.received = 0
+			tlsop.cb(tlsop)
+			free(tlsop)
+			return
+		}
+
 		nbio.poll_poly(tlsop.send.socket, _map_blocked_to_poll(blocked), tlsop, send_cb)
 	}
 }
@@ -223,6 +235,11 @@ close :: proc(conn: ^Connection, cb: Callback) {
 
 		blocked: s2n.Blocked_Status
 		if s2n.s2n_shutdown(tlsop.conn, &blocked) == s2n.Success {
+			nbio.close_poly(tlsop.close.socket, tlsop, socket_close_cb)
+			return
+		}
+
+		if _s2n_error() != .Blocked {
 			nbio.close_poly(tlsop.close.socket, tlsop, socket_close_cb)
 			return
 		}
@@ -281,4 +298,9 @@ _get_err :: proc(op: ^nbio.Operation) -> (err: Error) {
 		assert(false)
 	}
 	return
+}
+
+_s2n_error :: proc() -> s2n.Error_Type {
+	errno := s2n.s2n_errno_location()
+	return s2n.Error_Type(s2n.s2n_error_get_type(errno^))
 }

@@ -3,9 +3,12 @@ package main
 import nbtls ".."
 import "core:log"
 import "core:nbio"
+import "core:sys/posix"
 
 main :: proc() {
-	// context.logger = log.create_console_logger()
+	posix.sigignore(.SIGPIPE)
+
+	context.logger = log.create_console_logger()
 
 	nbio.acquire_thread_event_loop()
 	defer nbio.release_thread_event_loop()
@@ -31,6 +34,7 @@ accept_cb :: proc(op: ^nbtls.Operation) {
 }
 
 recv_cb :: proc(op: ^nbtls.Operation) {
+	log.debug("recv callback")
 	if op.recv.received == 0 do return
 
 	log.debug("received", op.recv.received)

@@ -1,13 +1,18 @@
 package main
 
 import nbtls ".."
+import "core:fmt"
 import "core:log"
 import "core:nbio"
-import "core:sys/posix"
+
+Elem :: struct {
+	data: [504]byte,
+	link: ^Elem,
+}
+
+config_example_local: ^nbtls.Config
 
 main :: proc() {
-	posix.sigignore(.SIGPIPE)
-
 	context.logger = log.create_console_logger()
 
 	nbio.acquire_thread_event_loop()
@@ -16,8 +21,10 @@ main :: proc() {
 	socket, err := nbio.listen_tcp({nbio.IP4_Any, 8443})
 	assert(err == nil)
 
+	config_example_local = nbtls.config_init_with_cert_and_key(cert_pem, key_pem)
+	defer nbtls.config_destroy(config_example_local)
 
-	config := nbtls.config_init_with_cert_and_key(cert_pem, key_pem)
+	config := nbtls.config_init_with_cert_cb()
 	defer nbtls.config_destroy(config)
 
 	nbtls.accept(socket, config, accept_cb)
@@ -25,20 +32,26 @@ main :: proc() {
 }
 
 accept_cb :: proc(op: ^nbtls.Operation) {
-	log.debug("accepted client", op.accept.client)
+	fmt.println("accepted client with server_name")
 
-	buf := make([]byte, 1024)
+	nbtls.handshake(op.conn, config_example_local, handshake_cb)
+	nbtls.accept(op.accept.socket, op.accept.config, accept_cb)
+}
+
+handshake_cb :: proc(op: ^nbtls.Operation) {
+	fmt.println("handshake done")
+
+	buf := make([]byte, 512)
 	nbtls.recv(op.conn, buf, recv_cb)
-
-	nbtls.accept(op.accept.socket, op.config, accept_cb)
 }
 
 recv_cb :: proc(op: ^nbtls.Operation) {
-	log.debug("recv callback")
+	fmt.println("recv callback")
 	if op.recv.received == 0 do return
 
-	log.debug("received", op.recv.received)
+	fmt.println("received", op.recv.received)
 	log.debug(string(op.recv.buf[:op.recv.received]))
+
 	delete(op.recv.buf)
 
 	msg := "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\nok\n"

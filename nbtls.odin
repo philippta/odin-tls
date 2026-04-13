@@ -1,7 +1,8 @@
 package nbtls
 
+import "base:runtime"
 import "core:c"
-import "core:log"
+import "core:fmt"
 import "core:nbio"
 import "core:os"
 import "core:strings"
@@ -11,17 +12,23 @@ Connection :: s2n.Connection
 Config :: s2n.Config
 
 Callback :: #type proc(op: ^Operation)
+Client_Hello_Callback :: #type proc(
+	conn: ^Connection,
+	server_name: string,
+	cb: Set_Certificate_Callback,
+)
+Set_Certificate_Callback :: #type proc(conn: ^Connection, config: ^Config)
 
 Operation :: struct {
-	cb:              Callback,
-	config:          ^Config,
-	conn:            ^Connection,
-	type:            Operation_Type,
-	using specifics: Specifics,
+	cb:             Callback,
+	conn:           ^Connection,
+	type:           Operation_Type,
+	using specifcs: Specifics,
 }
 
 Operation_Type :: enum {
 	Accept,
+	Handshake,
 	Recv,
 	Send,
 	Close,
@@ -35,28 +42,25 @@ Specifics :: struct #raw_union {
 }
 
 Accept :: struct {
-	socket: nbio.TCP_Socket,
-	client: nbio.TCP_Socket,
-	err:    Error,
+	socket:      nbio.TCP_Socket,
+	config:      ^Config,
+	server_name: string,
 }
 
 Recv :: struct {
 	socket:   nbio.TCP_Socket,
 	buf:      []byte,
 	received: int,
-	err:      Error,
 }
 
 Send :: struct {
 	socket: nbio.TCP_Socket,
 	buf:    []byte,
 	sent:   int,
-	err:    Error,
 }
 
 Close :: struct {
 	socket: nbio.TCP_Socket,
-	err:    Error,
 }
 
 Error :: union {
@@ -64,6 +68,11 @@ Error :: union {
 	nbio.Network_Error,
 	nbio.Recv_Error,
 	nbio.Send_Error,
+}
+
+config_init :: proc() -> ^Config {
+	s2n.s2n_init()
+	return s2n.s2n_config_new()
 }
 
 config_init_with_cert_and_key_file :: proc(
@@ -87,83 +96,150 @@ config_init_with_cert_and_key :: proc(
 ) -> ^Config {
 	certc := strings.clone_to_cstring(string(cert_pem), allocator)
 	keyc := strings.clone_to_cstring(string(key_pem), allocator)
+	defer delete(certc)
+	defer delete(keyc)
 
 	config := config_init()
-	assert(config != nil)
 	assert(s2n.s2n_config_set_cipher_preferences(config, "default") == s2n.Success)
 	assert(s2n.s2n_config_add_cert_chain_and_key(config, certc, keyc) == s2n.Success)
 
 	return config
 }
 
-config_init :: proc() -> ^Config {
-	s2n.s2n_init()
-	return s2n.s2n_config_new()
+config_init_with_cert_cb :: proc() -> ^Config {
+	config := config_init()
+
+	saved_ctx := new_clone(context)
+	assert(s2n.s2n_config_set_ctx(config, saved_ctx) == s2n.Success)
+	assert(s2n.s2n_config_set_client_hello_cb(config, client_hello_cb, saved_ctx) == s2n.Success)
+	assert(s2n.s2n_config_set_client_hello_cb_mode(config, .Nonblocking) == s2n.Success)
+
+	return config
 }
 
 config_destroy :: proc(config: ^Config) {
+	ctx: rawptr
+	s2n.s2n_config_get_ctx(config, &ctx)
+	if ctx != nil {
+		free(ctx)
+	}
+
 	s2n.s2n_config_free(config)
 }
 
 accept :: proc(socket: nbio.TCP_Socket, config: ^Config, cb: Callback) {
-	tlsop := new(Operation)
-	tlsop.cb = cb
-	tlsop.config = config
-	tlsop.type = .Accept
-	tlsop.accept.socket = socket
-	nbio.accept_poly2(socket, tlsop, config, accept_cb)
+	tlsop := new_clone(
+		Operation{cb = cb, type = .Accept, accept = {socket = socket, config = config}},
+	)
+	nbio.accept_poly(socket, tlsop, accept_cb)
 
-	accept_cb :: proc(op: ^nbio.Operation, tlsop: ^Operation, config: ^Config) {
-		log.debug("accept_cb")
-
-		tlsop.accept.client = op.accept.client
-
-		if op.accept.err != nil {
-			tlsop.accept.err = op.accept.err
-			tlsop.cb(tlsop)
-			free(tlsop)
-			return
-		}
+	accept_cb :: proc(op: ^nbio.Operation, tlsop: ^Operation) {
+		fmt.println("accept_cb")
+		assert(op.accept.err == nil)
+		assert(tlsop.type == .Accept)
 
 		tlsop.conn = s2n.s2n_connection_new(.Server)
 		assert(tlsop.conn != nil)
 
-		assert(s2n.s2n_connection_set_config(tlsop.conn, config) == s2n.Success)
+		assert(s2n.s2n_connection_set_config(tlsop.conn, tlsop.accept.config) == s2n.Success)
 		assert(s2n.s2n_connection_set_fd(tlsop.conn, c.int(op.accept.client)) == s2n.Success)
+		assert(s2n.s2n_connection_set_ctx(tlsop.conn, tlsop) == s2n.Success)
 
-		handshake_cb(nil, tlsop)
+		nbio.poll_poly(op.accept.client, .Receive, tlsop, handshake_cb)
 	}
 
-	handshake_cb :: proc(_: ^nbio.Operation, tlsop: ^Operation) {
-		log.debug("handshake_cb")
+	handshake_cb :: proc(op: ^nbio.Operation, tlsop: ^Operation) {
+		assert(tlsop.type == .Accept)
 
 		blocked: s2n.Blocked_Status
-		if s2n.s2n_negotiate(tlsop.conn, &blocked) == s2n.Success {
+		s2n.s2n_negotiate(tlsop.conn, &blocked)
+
+		switch blocked {
+		case .Blocked_On_Read:
+			nbio.poll_poly(op.poll.socket, .Receive, tlsop, handshake_cb)
+		case .Blocked_On_Write:
+			nbio.poll_poly(op.poll.socket, .Send, tlsop, handshake_cb)
+		case .Blocked_On_Application_Input:
+			return
+		case .Blocked_On_Early_Data:
+			panic("not implemented")
+		case .Not_Blocked:
+			panic("s2n_negotiate should always block")
+		}
+	}
+
+}
+
+client_hello_cb :: proc "c" (conn: ^Connection, ctx: rawptr) -> c.int {
+	context = (cast(^runtime.Context)ctx)^
+
+	server_name := string(s2n.s2n_get_server_name(conn))
+	assert(s2n.s2n_connection_server_name_extension_used(conn) == s2n.Success)
+
+	tlsop := cast(^Operation)s2n.s2n_connection_get_ctx(conn)
+	assert(tlsop.type == .Accept)
+	tlsop.accept.server_name = server_name
+
+	nbio.next_tick_poly(tlsop, tick)
+
+	tick :: proc(_: ^nbio.Operation, tlsop: ^Operation) {
+		tlsop.cb(tlsop)
+		free(tlsop)
+		return
+	}
+
+	return s2n.Success
+}
+
+handshake :: proc(conn: ^Connection, config: ^Config, cb: Callback) {
+	fmt.println("handshake set_cert")
+
+	socket: nbio.TCP_Socket
+	assert(s2n.s2n_connection_get_read_fd(conn, transmute(^c.int)&socket) == s2n.Success)
+	assert(s2n.s2n_client_hello_cb_done(conn) == s2n.Success)
+	assert(s2n.s2n_connection_set_config(conn, config) == s2n.Success)
+
+	tlsop := new_clone(Operation{cb = cb, conn = conn, type = .Handshake})
+	nbio.poll_poly(socket, .Send, tlsop, handshake_cb)
+
+	handshake_cb :: proc(op: ^nbio.Operation, tlsop: ^Operation) {
+		blocked: s2n.Blocked_Status
+		ret := s2n.s2n_negotiate(tlsop.conn, &blocked)
+
+		if ret == s2n.Success {
 			tlsop.cb(tlsop)
 			free(tlsop)
 			return
 		}
 
-		nbio.poll_poly(tlsop.accept.client, _map_blocked_to_poll(blocked), tlsop, handshake_cb)
+		switch blocked {
+		case .Blocked_On_Read:
+			nbio.poll_poly(op.poll.socket, .Receive, tlsop, handshake_cb)
+		case .Blocked_On_Write:
+			nbio.poll_poly(op.poll.socket, .Send, tlsop, handshake_cb)
+		case .Blocked_On_Application_Input:
+			panic("s2n_negotiate should not block on application input here")
+		case .Blocked_On_Early_Data:
+			panic("not implemented")
+		case .Not_Blocked:
+			panic("not implemented")
+		}
 	}
 }
 
 recv :: proc(conn: ^Connection, buf: []byte, cb: Callback) {
-	socket: c.int
-	assert(s2n.s2n_connection_get_read_fd(conn, &socket) == s2n.Success)
+	socket: nbio.TCP_Socket
+	assert(s2n.s2n_connection_get_read_fd(conn, transmute(^c.int)&socket) == s2n.Success)
 
-	tlsop := new(Operation)
-	tlsop.cb = cb
-	tlsop.conn = conn
-	tlsop.type = .Recv
-	tlsop.recv.socket = nbio.TCP_Socket(socket)
-	tlsop.recv.buf = buf
-
-	recv_cb(nil, tlsop)
+	tlsop := new_clone(
+		Operation{cb = cb, conn = conn, type = .Recv, recv = {socket = socket, buf = buf}},
+	)
+	nbio.poll_poly(socket, .Receive, tlsop, recv_cb)
 
 	recv_cb :: proc(op: ^nbio.Operation, tlsop: ^Operation) {
 		blocked: s2n.Blocked_Status
 		n := s2n.s2n_recv(tlsop.conn, raw_data(tlsop.recv.buf), len(tlsop.recv.buf), &blocked)
+
 		if n >= 0 {
 			tlsop.recv.received = n
 			tlsop.cb(tlsop)
@@ -171,7 +247,7 @@ recv :: proc(conn: ^Connection, buf: []byte, cb: Callback) {
 			return
 		}
 
-		if _s2n_error() != .Blocked {
+		if n == -1 && _s2n_error() != .Blocked {
 			tlsop.recv.received = 0
 			tlsop.cb(tlsop)
 			free(tlsop)
@@ -183,58 +259,49 @@ recv :: proc(conn: ^Connection, buf: []byte, cb: Callback) {
 }
 
 send :: proc(conn: ^Connection, buf: []byte, cb: Callback) {
-	socket: c.int
-	assert(s2n.s2n_connection_get_read_fd(conn, &socket) == s2n.Success)
+	socket: nbio.TCP_Socket
+	assert(s2n.s2n_connection_get_read_fd(conn, transmute(^c.int)&socket) == s2n.Success)
 
-	tlsop := new(Operation)
-	tlsop.cb = cb
-	tlsop.conn = conn
-	tlsop.type = .Send
-	tlsop.send.socket = nbio.TCP_Socket(socket)
-	tlsop.send.buf = buf
+	tlsop := new_clone(
+		Operation{cb = cb, conn = conn, type = .Send, send = {socket = socket, buf = buf}},
+	)
 
-	send_cb(nil, tlsop)
+	nbio.poll_poly(socket, .Send, tlsop, send_cb)
 
 	send_cb :: proc(_: ^nbio.Operation, tlsop: ^Operation) {
-		log.debug("send_cb")
-
 		blocked: s2n.Blocked_Status
-		n := s2n.s2n_send(tlsop.conn, raw_data(tlsop.send.buf), len(tlsop.send.buf), &blocked)
+		n := s2n.s2n_send(tlsop.conn, raw_data(tlsop.recv.buf), len(tlsop.recv.buf), &blocked)
+
 		if n >= 0 {
-			tlsop.send.sent = n
+			tlsop.recv.received = n
 			tlsop.cb(tlsop)
 			free(tlsop)
 			return
 		}
 
-		if _s2n_error() != .Blocked {
+		if n == -1 && _s2n_error() != .Blocked {
 			tlsop.recv.received = 0
 			tlsop.cb(tlsop)
 			free(tlsop)
 			return
 		}
 
-		nbio.poll_poly(tlsop.send.socket, _map_blocked_to_poll(blocked), tlsop, send_cb)
+		nbio.poll_poly(tlsop.recv.socket, _map_blocked_to_poll(blocked), tlsop, send_cb)
 	}
 }
 
 close :: proc(conn: ^Connection, cb: Callback) {
-	socket: c.int
-	assert(s2n.s2n_connection_get_read_fd(conn, &socket) == s2n.Success)
+	socket: nbio.TCP_Socket
+	assert(s2n.s2n_connection_get_read_fd(conn, transmute(^c.int)&socket) == s2n.Success)
 
-	tlsop := new(Operation)
-	tlsop.cb = cb
-	tlsop.conn = conn
-	tlsop.type = .Close
-	tlsop.close.socket = nbio.TCP_Socket(socket)
-
-	close_cb(nil, tlsop)
+	tlsop := new_clone(Operation{cb = cb, conn = conn, type = .Close, close = {socket = socket}})
+	nbio.poll_poly(socket, .Send, tlsop, close_cb)
 
 	close_cb :: proc(_: ^nbio.Operation, tlsop: ^Operation) {
-		log.debug("close_cb")
-
 		blocked: s2n.Blocked_Status
-		if s2n.s2n_shutdown(tlsop.conn, &blocked) == s2n.Success {
+		ret := s2n.s2n_shutdown(tlsop.conn, &blocked)
+
+		if ret == s2n.Success {
 			nbio.close_poly(tlsop.close.socket, tlsop, socket_close_cb)
 			return
 		}
@@ -248,8 +315,6 @@ close :: proc(conn: ^Connection, cb: Callback) {
 	}
 
 	socket_close_cb :: proc(_: ^nbio.Operation, tlsop: ^Operation) {
-		log.debug("socket_close_cb")
-		tlsop.conn = nil
 		tlsop.cb(tlsop)
 		s2n.s2n_connection_free(tlsop.conn)
 		free(tlsop)
